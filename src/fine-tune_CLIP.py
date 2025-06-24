@@ -2,15 +2,24 @@ import glob
 import os
 import torch
 import numpy as np
+import pandas as pd
 import logging
 
 from transformers import AutoModel, AutoProcessor, TrainingArguments, Trainer
 from datasets import Dataset, Image
 from peft import LoraConfig, get_peft_model
-from PIL import Image as PILImage # Used for image processing within preprocess_data
+from PIL import Image as PILImage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+### -- Config:  Data Loading and Preprocessing -- ###
+METADATA_DIR = '/content/drive/MyDrive/clip_project_data/listings/metadata/'
+IMAGE_CSV_PATH ='s3://amazon-berkeley-objects/images/metadata/images.csv.gz'
+BASE_IMAGE_DIR = 's3://amazon-berkeley-objects/images/small/'
+OUTPUT_DIR = '/content/drive/MyDrive/clip_project_data/clip_lora_finetuned/'
+FINAL_OUTPUT_DIR = '/content/drive/MyDrive/clip_project_data/clip_lora_finetuned_final_adapters/'
+
 
 # === Load model & processor ===
 MODEL_CHECKPOINT = "openai/clip-vit-base-patch32"
@@ -22,41 +31,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 model = AutoModel.from_pretrained(MODEL_CHECKPOINT).to(device)
 processor = AutoProcessor.from_pretrained(MODEL_CHECKPOINT, use_fast=True)
 logging.info(f"Model loaded and moved to device: {device}")
-
-
-def concatenate_text_attributes(df):
-    """
-    Concatenate the values of each column into a single natural language string per row.
-    Example: "the item_name is Shirt, the brand is Nike, the style is Casual"
-
-    Args:
-        df (pd.DataFrame): DataFrame containing product attributes.
-
-    Returns:
-        pd.DataFrame: DataFrame with 'attributes_nl' column and relevant IDs.
-    """
-    # Exclude item_id and main_image_id from concatenation
-    columns = [col for col in df.columns if col not in ('item_id', 'main_image_id')]
-
-    # Define a character limit for each attribute value to keep the concatenated string concise
-    MAX_CHAR_LENGTH_PER_ATTRIBUTE = 50
-
-    def row_to_natural_language(row):
-        parts = []
-        for col in columns:
-            value = row[col]
-            # Only include non-empty string values. Convert to string to avoid issues with non-string types.
-            if isinstance(value, str) and value.strip():
-                # Apply the character limit to the value
-                limited_value = value.strip()
-                if len(limited_value) > MAX_CHAR_LENGTH_PER_ATTRIBUTE:
-                    limited_value = limited_value[:MAX_CHAR_LENGTH_PER_ATTRIBUTE] + "..." # Add ellipsis for truncated text
-                parts.append(f"the {col.replace('_', ' ')} is {limited_value}")
-        return ', '.join(parts)
-
-    df['attributes_nl'] = df.apply(row_to_natural_language, axis=1)
-    logging.info("Concatenated text attributes into 'attributes_nl' column.")
-    return df[['item_id', 'main_image_id' ,'attributes_nl']]
 
 
 def process_json_attributes(path):
@@ -95,8 +69,42 @@ def process_json_attributes(path):
     logging.info(f"Processed JSON attributes for file: {os.path.basename(path)}")
     return df
 
+def concatenate_text_attributes(df):
+    """
+    Concatenate the values of each column into a single natural language string per row.
+    Example: "the item_name is Shirt, the brand is Nike, the style is Casual"
 
-def preprocess_data(examples):
+    Args:
+        df (pd.DataFrame): DataFrame containing product attributes.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'attributes_nl' column and relevant IDs.
+    """
+    # Exclude item_id and main_image_id from concatenation
+    columns = [col for col in df.columns if col not in ('item_id', 'main_image_id')]
+
+    # Define a character limit for each attribute value to keep the concatenated string concise
+    MAX_CHAR_LENGTH_PER_ATTRIBUTE = 50
+
+    def row_to_natural_language(row):
+        parts = []
+        for col in columns:
+            value = row[col]
+            # Only include non-empty string values. Convert to string to avoid issues with non-string types.
+            if isinstance(value, str) and value.strip():
+                # Apply the character limit to the value
+                limited_value = value.strip()
+                if len(limited_value) > MAX_CHAR_LENGTH_PER_ATTRIBUTE:
+                    limited_value = limited_value[:MAX_CHAR_LENGTH_PER_ATTRIBUTE] + "..." # Add ellipsis for truncated text
+                parts.append(f"the {col.replace('_', ' ')} is {limited_value}")
+        return ', '.join(parts)
+
+    df['attributes_nl'] = df.apply(row_to_natural_language, axis=1)
+    logging.info("Concatenated text attributes into 'attributes_nl' column.")
+    return df[['item_id', 'main_image_id' ,'attributes_nl']]
+
+
+def preprocess_data(examples, processor): # Added processor as argument
     """
     Preprocesses the data (text tokenization and image feature extraction)
     using the CLIP processor.
@@ -104,6 +112,7 @@ def preprocess_data(examples):
     Args:
         examples (dict): A dictionary containing 'text' (list of strings)
                          and 'image' (list of PIL Image objects).
+        processor: The CLIP processor object.
 
     Returns:
         dict: A dictionary with 'input_ids', 'attention_mask', and 'pixel_values'
@@ -111,7 +120,6 @@ def preprocess_data(examples):
     """
     images = [img.convert("RGB") for img in examples['image']]
     texts = examples['text']
-
 
     image_inputs = processor.image_processor(
         images=images,
@@ -125,8 +133,6 @@ def preprocess_data(examples):
         truncation=True
     )
 
-    # The `pixel_values` will already be a batch if multiple images are passed.
-    # Same for `input_ids` and `attention_mask`.
     return {
         'input_ids': text_inputs['input_ids'],
         'attention_mask': text_inputs['attention_mask'],
@@ -153,15 +159,11 @@ class CLIPTrainer(Trainer):
         """
         # Ensure inputs are moved to the correct device
         # Filter inputs to only include what CLIPModel.forward() expects
-        # This prevents unexpected keyword arguments like 'inputs_embeds' from being passed
         expected_keys = {'input_ids', 'attention_mask', 'pixel_values'}
         filtered_inputs = {k: v.to(model.device) for k, v in inputs.items() if k in expected_keys}
         
-        # Pass inputs to the model. The CLIPModel in transformers automatically
-        # computes the contrastive loss if no 'labels' are provided but 'input_ids'
-        # and 'pixel_values' are present and return_loss=True (which Trainer sets).
         outputs = model(**filtered_inputs, return_loss=True)
-        loss = outputs.loss # The CLIPModel computes the contrastive loss internally
+        loss = outputs.loss
 
         return (loss, outputs) if return_outputs else loss
 
@@ -244,17 +246,13 @@ class CLIPTrainer(Trainer):
 
 class CLIPDataCollator:
     """
-    Data Collator for CLIP. It stacks the processed tensors.
-    This collator is mostly for ensuring proper batching after `set_transform`
-    has already applied the processor.
+    Data Collator for CLIP.
     """
-    def __init__(self, processor):
+    def __init__(self, processor): # processor parameter is not strictly needed here if set_transform uses lambda
         self.processor = processor
 
     def __call__(self, features):
-        # features is a list of dictionaries, where each dict is a preprocessed example
-        # { 'input_ids': tensor, 'attention_mask': tensor, 'pixel_values': tensor }
-        pixel_values = torch.stack([item['pixel_values'].squeeze(0) for item in features]) # squeeze(0) if preprocess_data returns a batch dim for single items
+        pixel_values = torch.stack([item['pixel_values'].squeeze(0) for item in features])
         input_ids = torch.stack([item['input_ids'].squeeze(0) for item in features])
         attention_mask = torch.stack([item['attention_mask'].squeeze(0) for item in features])
 
@@ -267,24 +265,7 @@ class CLIPDataCollator:
 # --- Start of the main execution block ---
 if __name__ == '__main__':
     logging.info("Starting CLIP fine-tuning script.")
-
     ### -- Data Loading and Preprocessing -- ###
-    # Make paths configurable or relative
-    # CURRENTLY HARDCODED: This should ideally be passed as arguments or from a config file.
-    METADATA_DIR = 'c:/Users/mirko/Documents/Coding/transformers/data/listings/metadata/'
-    IMAGE_CSV_PATH = "c:/Users/mirko/Documents/Coding/transformers/data/abo-images-small/images/metadata/images.csv.gz"
-    BASE_IMAGE_DIR = r'c:/Users/mirko/Documents/Coding/transformers/data/abo-images-small/images/small/'
-
-    if not os.path.exists(METADATA_DIR):
-        logging.error(f"Metadata directory not found: {METADATA_DIR}")
-        exit()
-    if not os.path.exists(IMAGE_CSV_PATH):
-        logging.error(f"Image CSV file not found: {IMAGE_CSV_PATH}")
-        exit()
-    if not os.path.exists(BASE_IMAGE_DIR):
-        logging.error(f"Base image directory not found: {BASE_IMAGE_DIR}")
-        exit()
-
 
     logging.info("Processing JSON attributes from metadata files...")
     all_files = glob.glob(os.path.join(METADATA_DIR, '*.json.gz'))
@@ -299,12 +280,8 @@ if __name__ == '__main__':
             text_attr = concatenate_text_attributes(df)
             dfs.append(text_attr)
 
-    if not dfs:
-        logging.error("No data processed from JSON files. Exiting.")
-        exit()
-
-    all_text_attr = pd.concat(dfs, ignore_index=True)
-    logging.info(f"Total processed text attributes rows: {len(all_text_attr)}")
+    text_df = pd.concat(dfs, ignore_index=True)
+    logging.info(f"Total processed text attributes rows: {len(text_df)}")
 
     logging.info("Loading image metadata...")
     img_df = pd.read_csv(IMAGE_CSV_PATH)
@@ -313,21 +290,14 @@ if __name__ == '__main__':
     logging.info(f"Total image metadata rows: {len(img_df)}")
 
     logging.info("Merging text attributes and image metadata...")
-    merged_df = pd.merge(all_text_attr, img_df, on='main_image_id', how='inner')
-    # Filter out rows where image_path might be missing if path is not found later
-    merged_df['image_path'] = merged_df['path'].apply(lambda x: os.path.join(BASE_IMAGE_DIR, x))
+    merged_df = pd.merge(text_df, img_df, on='main_image_id', how='inner')
     
-    # Filter out rows where the image file does not exist to prevent errors during loading
-    original_rows = len(merged_df)
-    merged_df = merged_df[merged_df['image_path'].apply(os.path.exists)]
-    logging.info(f"Filtered to {len(merged_df)} rows after checking image file existence (removed {original_rows - len(merged_df)} non-existent image paths).")
-
-    if merged_df.empty:
-        logging.error("Merged DataFrame is empty after path validation. Exiting.")
-        exit()
+    # --- PATH CONSTRUCTION FOR S3 ---
+    merged_df['image_path'] = merged_df['path'].apply(lambda x: f"{BASE_IMAGE_DIR}{x}")
 
     ### -- Hugging Face Dataset Creation and Preprocessing -- ###
     logging.info("Creating Hugging Face Dataset...")
+    # datasets.Image() feature can handle S3 URIs if s3fs is installed and configured.
     dataset = Dataset.from_pandas(merged_df).cast_column("image_path", Image())
 
     dataset = dataset.rename_column("attributes_nl", "text")
@@ -335,11 +305,11 @@ if __name__ == '__main__':
     dataset = dataset.remove_columns(['item_id', 'main_image_id', 'path'])
     logging.info(f"Dataset created with {len(dataset)} examples.")
     logging.info("Applying preprocessing transformation...")
-    dataset.set_transform(preprocess_data)
+    # Pass processor to preprocess_data via lambda
+    dataset.set_transform(lambda examples: preprocess_data(examples, processor)) 
 
     # Split dataset for training and validation
-    # It's crucial to have a validation set to monitor overfitting and progress
-    train_test_split = dataset.train_test_split(test_size=0.1, seed=42) # 10% for validation
+    train_test_split = dataset.train_test_split(test_size=0.1, seed=42)
     train_dataset = train_test_split['train']
     eval_dataset = train_test_split['test']
     logging.info(f"Dataset split: Train {len(train_dataset)} examples, Eval {len(eval_dataset)} examples.")
@@ -358,38 +328,39 @@ if __name__ == '__main__':
     # Apply LoRA to the model
     model = get_peft_model(model, lora_config)
     logging.info("LoRA applied to the model.")
+    model.print_trainable_parameters()
 
     ### -- Training Setup -- ###
     data_collator = CLIPDataCollator(processor) # Use the custom collator
 
     logging.info("Setting up TrainingArguments...")
     training_args = TrainingArguments(
-        output_dir="./clip_lora_finetuned",
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=32, # Use a larger batch size for evaluation if memory permits
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=64,
+        per_device_eval_batch_size=64,
         gradient_accumulation_steps=1,
-        learning_rate=2e-5, # A common learning rate for LoRA fine-tuning. Can be slightly higher than full fine-tuning.
-        num_train_epochs=3, # Number of training epochs. Start with 3, monitor metrics.
-        lr_scheduler_type="cosine", # Cosine annealing learning rate scheduler.
-        warmup_ratio=0.1, # Percentage of total steps for linear warmup.
-        logging_steps=100, # Log training progress every 100 steps.
-        save_strategy="epoch", # Save model checkpoint at the end of each epoch.
-        report_to="wandb", # Integrate with Weights & Biases for experiment tracking.
-        remove_unused_columns=False, # Essential when using set_transform and custom collators.
-        fp16=True, # Enable mixed precision training for speed and memory efficiency.
-        dataloader_num_workers=4, # Number of subprocesses to use for data loading. Important for performance.
-        eval_strategy="epoch", # We run the evaluation outlined in CLIP
-        load_best_model_at_end=True, # Load the best model based on evaluation metric at the end of training.
-        metric_for_best_model="eval_loss", # Metric to use for determining the best model.
-        greater_is_better=False, # For loss, lower is better.
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        logging_steps=100,
+        save_strategy="epoch",
+        report_to="wandb",
+        remove_unused_columns=False,
+        fp16=True,
+        dataloader_num_workers=4,
+        eval_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
 
     logging.info("Initializing Trainer...")
-    trainer = CLIPTrainer( # Use the custom CLIPTrainer
+    trainer = CLIPTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset, # Pass the validation set
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
 
@@ -399,12 +370,12 @@ if __name__ == '__main__':
     logging.info("Training completed.")
 
     # Save the final LoRA adapters
-    final_output_dir = "./clip_lora_finetuned_final_adapters"
-    os.makedirs(final_output_dir, exist_ok=True)
-    model.save_pretrained(final_output_dir)
-    logging.info(f"Final LoRA adapters saved to {final_output_dir}")
+    # Consider making this dynamic for Colab
+    os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
+    model.save_pretrained(FINAL_OUTPUT_DIR)
+    logging.info(f"Final LoRA adapters saved to {FINAL_OUTPUT_DIR}")
 
-    # Example of how to load and merge for inference
+    # Example of how to load and merge for inference (commented out)
     # from peft import PeftModel, PeftConfig
     # # Load the base model
     # base_model = AutoModel.from_pretrained(MODEL_CHECKPOINT).to(device)
