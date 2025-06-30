@@ -274,20 +274,20 @@ if __name__ == '__main__':
                                       "image_path": "image"})
     dataset = dataset.remove_columns(['item_id', 'main_image_id', 'path'])
     logging.info(f"Dataset created with {len(dataset)} examples.")
-    
-    logging.info("Applying preprocessing transformation...")
-    dataset.set_transform(lambda examples: preprocess_data(examples, processor)) 
 
+    # Train test split
     train_test_split = dataset.train_test_split(test_size=TEST_SPLIT_RATIO, seed=RANDOM_SEED)
     train_dataset = train_test_split['train']
     eval_dataset = train_test_split['test'] # Keep eval_dataset for potential manual evaluation later
     logging.info(f"Dataset split: Train {len(train_dataset)} examples, Eval {len(eval_dataset)} examples.")
 
-    # --- Save eval_dataset to Google Drive ---
+    # --- Save raw eval_dataset to Google Drive ---
     os.makedirs(SAVED_EVAL_DATASET_DIR, exist_ok=True)
     eval_dataset.save_to_disk(SAVED_EVAL_DATASET_DIR)
     logging.info(f"Evaluation dataset saved to: {SAVED_EVAL_DATASET_DIR}")
-
+    
+    logging.info("Applying preprocessing transformation...")
+    train_dataset.set_transform(lambda examples: preprocess_data(examples, processor)) 
 
     # 3. LoRA Configuration & Application
     logging.info("Applying LoRA configuration to the model...")
@@ -315,11 +315,8 @@ if __name__ == '__main__':
         remove_unused_columns=False,
         fp16=True,
         dataloader_num_workers=DATALOADER_NUM_WORKERS,
-        
-        # --- Critical Changes for Frequent Saving without Frequent Evaluation ---
         eval_strategy="no", # Explicitly disables evaluation during trainer.train()
         load_best_model_at_end=False, # Must be False if eval_strategy is "no"
-        # metric_for_best_model and greater_is_better are ignored when load_best_model_at_end=False
     )
 
     logging.info("Initializing Trainer...")
@@ -327,7 +324,6 @@ if __name__ == '__main__':
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        # eval_dataset=eval_dataset, # Removed: Not needed for eval_strategy="no" during train()
         data_collator=data_collator,
     )
 
