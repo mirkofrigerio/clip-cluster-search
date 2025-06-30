@@ -336,23 +336,22 @@ if __name__ == '__main__':
     logging.info("Setting up TrainingArguments...")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=64,
-        per_device_eval_batch_size=64,
+        per_device_train_batch_size=128,
+        per_device_eval_batch_size=128,
         gradient_accumulation_steps=1,
         learning_rate=2e-5,
         num_train_epochs=3,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
         logging_steps=100,
-        save_strategy="epoch",
+        save_strategy="steps",
+        save_steps=100,
         report_to="wandb",
         remove_unused_columns=False,
         fp16=True,
         dataloader_num_workers=4,
-        eval_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        eval_strategy="no",
+        load_best_model_at_end=False,
     )
 
     logging.info("Initializing Trainer...")
@@ -360,7 +359,6 @@ if __name__ == '__main__':
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
 
@@ -370,7 +368,6 @@ if __name__ == '__main__':
     logging.info("Training completed.")
 
     # Save the final LoRA adapters
-    # Consider making this dynamic for Colab
     os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
     model.save_pretrained(FINAL_OUTPUT_DIR)
     logging.info(f"Final LoRA adapters saved to {FINAL_OUTPUT_DIR}")
