@@ -19,13 +19,29 @@ IMAGE_CSV_PATH ='s3://amazon-berkeley-objects/images/metadata/images.csv.gz'
 BASE_IMAGE_DIR = 's3://amazon-berkeley-objects/images/small/'
 OUTPUT_DIR = '/content/drive/MyDrive/clip_project_data/clip_lora_finetuned/'
 FINAL_OUTPUT_DIR = '/content/drive/MyDrive/clip_project_data/clip_lora_finetuned_final_adapters/'
+SAVED_EVAL_DATASET_DIR = '/content/drive/MyDrive/clip_project_data/eval_dataset_saved/'
 
-
-# === Load model & processor ===
+### -- Config:  Model and Training Hyperparameters
 MODEL_CHECKPOINT = "openai/clip-vit-base-patch32"
-logging.info(f"Loading CLIP model and processor from {MODEL_CHECKPOINT}")
+MAX_CHAR_LENGTH_PER_ATTRIBUTE = 100 # For concatenating text attributes
+TEST_SPLIT_RATIO = 0.1 # Percentage of dataset to use for validation
+RANDOM_SEED = 42
+TRAIN_BATCH_SIZE = 128
+EVAL_BATCH_SIZE = 128 # Matching train batch size for consistency, but eval not done during training
+LEARNING_RATE = 2e-5
+NUM_TRAIN_EPOCHS = 3
+LOGGING_STEPS = 100 # Log training progress (loss, LR, etc.) every X steps
+DATALOADER_NUM_WORKERS = 4 # Number of subprocesses for data loading
 
-# Load the base CLIP model and processor
+# LoRA Configuration
+LORA_CONFIG = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+    lora_dropout=0.1,
+    bias="none",
+)
+
 # Ensure this runs on GPU if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = AutoModel.from_pretrained(MODEL_CHECKPOINT).to(device)
@@ -33,90 +49,60 @@ processor = AutoProcessor.from_pretrained(MODEL_CHECKPOINT, use_fast=True)
 logging.info(f"Model loaded and moved to device: {device}")
 
 
-def process_json_attributes(path):
+# --- Helper Functions (Data Processing) ---
+
+def process_json_attributes(path: str) -> pd.DataFrame:
     """
-    Loads a gzipped JSON file, selects specific columns, and extracts text values
-    from list-of-dictionary attributes, filtering by English language tags (starting with 'en').
-
-    Args:
-        path (str): The path to the gzipped JSON file.
-
-    Returns:
-        pd.DataFrame: A DataFrame with processed columns, where JSON attributes
-                      are flattened into comma-separated strings, filtered by
-                      any language tag that starts with 'en'.
+    Loads a gzipped JSON file, selects relevant columns, and extracts/flattens text values.
+    Filters by English language tags.
     """
     try:
         df = pd.read_json(path, compression='gzip', lines=True)
     except Exception as e:
         logging.error(f"Error loading JSON file {path}: {e}")
-        return pd.DataFrame() # Return empty DataFrame on error
+        return pd.DataFrame()
 
     columns_to_keep = ['item_id', 'main_image_id', 'item_name', 'bullet_point', 'brand', 'product_type', 'style', 'item_keywords']
     df = df.loc[:, columns_to_keep]
 
-    for column in ['item_name', 'bullet_point' , 'brand', 'product_type', 'style', 'item_keywords']:
+    for column in ['item_name', 'bullet_point', 'brand', 'product_type', 'style', 'item_keywords']:
         df[column] = df[column].apply(
             lambda x: ', '.join(
                 str(item.get('value'))
                 for item in x
-                if isinstance(item, dict)
-                and 'value' in item
-                and item.get('value') is not None
+                if isinstance(item, dict) and 'value' in item and item.get('value') is not None
                 and str(item.get('language_tag', '')).startswith('en')
             ) if isinstance(x, list) else ''
         )
     logging.info(f"Processed JSON attributes for file: {os.path.basename(path)}")
     return df
 
-def concatenate_text_attributes(df):
+def concatenate_text_attributes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Concatenate the values of each column into a single natural language string per row.
-    Example: "the item_name is Shirt, the brand is Nike, the style is Casual"
-
-    Args:
-        df (pd.DataFrame): DataFrame containing product attributes.
-
-    Returns:
-        pd.DataFrame: DataFrame with 'attributes_nl' column and relevant IDs.
+    Concatenate column values into a single natural language string per row, with truncation. 
+    Note: The string becomes too long if we concatenate all the attributes. Here we limit item length in each to MAX_CHAR_LENGTH_PER_ATTRIBUTE
     """
-    # Exclude item_id and main_image_id from concatenation
-    columns = [col for col in df.columns if col not in ('item_id', 'main_image_id')]
+    columns_to_concat = [col for col in df.columns if col not in ('item_id', 'main_image_id')]
 
-    # Define a character limit for each attribute value to keep the concatenated string concise
-    MAX_CHAR_LENGTH_PER_ATTRIBUTE = 50
-
-    def row_to_natural_language(row):
+    def row_to_natural_language(row) -> str:
         parts = []
-        for col in columns:
+        for col in columns_to_concat:
             value = row[col]
-            # Only include non-empty string values. Convert to string to avoid issues with non-string types.
             if isinstance(value, str) and value.strip():
-                # Apply the character limit to the value
                 limited_value = value.strip()
                 if len(limited_value) > MAX_CHAR_LENGTH_PER_ATTRIBUTE:
-                    limited_value = limited_value[:MAX_CHAR_LENGTH_PER_ATTRIBUTE] + "..." # Add ellipsis for truncated text
+                    limited_value = limited_value[:MAX_CHAR_LENGTH_PER_ATTRIBUTE] + "..."
                 parts.append(f"the {col.replace('_', ' ')} is {limited_value}")
         return ', '.join(parts)
 
     df['attributes_nl'] = df.apply(row_to_natural_language, axis=1)
     logging.info("Concatenated text attributes into 'attributes_nl' column.")
-    return df[['item_id', 'main_image_id' ,'attributes_nl']]
+    return df[['item_id', 'main_image_id', 'attributes_nl']]
 
-
-def preprocess_data(examples, processor): # Added processor as argument
+def preprocess_data(examples: dict, processor: AutoProcessor) -> dict:
     """
-    Preprocesses the data (text tokenization and image feature extraction)
-    using the CLIP processor.
-
-    Args:
-        examples (dict): A dictionary containing 'text' (list of strings)
-                         and 'image' (list of PIL Image objects).
-        processor: The CLIP processor object.
-
-    Returns:
-        dict: A dictionary with 'input_ids', 'attention_mask', and 'pixel_values'
-              ready for the model.
+    Preprocesses a batch of data (text tokenization and image feature extraction)
+    using the provided CLIP processor. Designed for `Dataset.set_transform()`.
     """
     images = [img.convert("RGB") for img in examples['image']]
     texts = examples['text']
@@ -140,118 +126,14 @@ def preprocess_data(examples, processor): # Added processor as argument
     }
 
 
-# --- Custom CLIP Trainer for Contrastive Loss ---
-class CLIPTrainer(Trainer):
-    """
-    We have to create a custome trainer, since the standard Trainer expects the model to compute the loss internally when a forward pass is done.
-    This is not the behaviour of CLIP, which, when given image and text, computes contrastive loss. Custom Trainer class for CLIP fine-tuning, specifically designed to handle
-    the contrastive loss inherent to CLIP models.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.model = self.model # Ensure the model is available
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        Computes the contrastive loss for CLIP.
-        The CLIP model's forward pass typically returns image_embeds, text_embeds, and logits_per_image/text.
-        The loss is then computed from these logits.
-        """
-        # Ensure inputs are moved to the correct device
-        # Filter inputs to only include what CLIPModel.forward() expects
-        expected_keys = {'input_ids', 'attention_mask', 'pixel_values'}
-        filtered_inputs = {k: v.to(model.device) for k, v in inputs.items() if k in expected_keys}
-        
-        outputs = model(**filtered_inputs, return_loss=True)
-        loss = outputs.loss
-
-        return (loss, outputs) if return_outputs else loss
-
-    def evaluation_loop(
-        self,
-        dataloader,
-        description,
-        prediction_loss_only=None,
-        ignore_keys=None,
-        metric_key_prefix: str = "eval",
-    ):
-        """
-        Custom evaluation loop to calculate recall@k metrics typical for CLIP.
-        """
-        model = self._wrap_model(self.model, training=False)
-        model.eval()
-        
-        all_image_embeds = []
-        all_text_embeds = []
-        
-        total_loss = 0.0
-        num_batches = 0
-
-        for step, inputs in enumerate(dataloader):
-            inputs = self._prepare_inputs(inputs)
-            # forward pass for each input batch of the validation set, to compute loss and embeddings similarity.
-            with torch.no_grad():
-                outputs = model(**inputs, return_loss=True)
-                loss = outputs.loss.item()
-                total_loss += loss
-                num_batches += 1
-
-                # Get embeddings
-                image_embeds = outputs.image_embeds
-                text_embeds = outputs.text_embeds
-
-                # Normalize embeddings
-                image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
-                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
-
-                all_image_embeds.append(image_embeds.cpu().numpy())
-                all_text_embeds.append(text_embeds.cpu().numpy())
-
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-
-        all_image_embeds = np.concatenate(all_image_embeds)
-        all_text_embeds = np.concatenate(all_text_embeds)
-
-        # Calculate cosine similarity matrix
-        # (N_images, D) @ (D, N_texts) -> (N_images, N_texts)
-        # remember, CLIP's loss isn't just cosine similarity, but it's an elaboration of that concept that introduces other params (temp)
-        similarity_scores = all_image_embeds @ all_text_embeds.T
-
-        # Calculate recall@k
-        # recall here tells me how good the model is at retriving the right text given an image.
-        # Assuming the diagonal elements are the correct pairs
-        num_samples = similarity_scores.shape[0]
-
-        k_values = [1, 5, 10] # Define k for recall@k
-        recall_at_k = {f"recall@{k}": 0 for k in k_values}
-
-        for i in range(num_samples):
-            # Get indices of top_k similar texts for image i
-            top_k_indices = np.argsort(similarity_scores[i, :])[::-1] # Descending order
-            
-            for k in k_values:
-                if i in top_k_indices[:k]:
-                    recall_at_k[f"recall@{k}"] += 1
-
-        for k in k_values:
-            recall_at_k[f"recall@{k}"] /= num_samples
-
-        metrics = {f"{metric_key_prefix}_loss": avg_loss}
-        metrics.update({f"{metric_key_prefix}_{k}": v for k, v in recall_at_k.items()})
-
-        # Log metrics
-        logging.info(f"Evaluation metrics: {metrics}")
-        return metrics
-
+# --- Custom Classes (Trainer and Data Collator) ---
 
 class CLIPDataCollator:
     """
-    Data Collator for CLIP.
+    Data Collator for CLIP. Stacks preprocessed tensors into batches.
+    `processor` is not needed here as `preprocess_data` handles it.
     """
-    def __init__(self, processor): # processor parameter is not strictly needed here if set_transform uses lambda
-        self.processor = processor
-
-    def __call__(self, features):
+    def __call__(self, features: list[dict]) -> dict:
         pixel_values = torch.stack([item['pixel_values'].squeeze(0) for item in features])
         input_ids = torch.stack([item['input_ids'].squeeze(0) for item in features])
         attention_mask = torch.stack([item['attention_mask'].squeeze(0) for item in features])
@@ -262,19 +144,109 @@ class CLIPDataCollator:
             'attention_mask': attention_mask,
         }
 
-# --- Start of the main execution block ---
+class CLIPTrainer(Trainer):
+    """
+    Custom Trainer for CLIP fine-tuning, handling contrastive loss and evaluation.
+    """
+    def compute_loss(self, model: torch.nn.Module, inputs: dict, return_outputs: bool = False, num_items_in_batch: int = None) -> torch.Tensor:
+        """Computes the contrastive loss for CLIP.
+        The CLIP model's forward pass typically returns image_embeds, text_embeds, and logits_per_image/text. 
+        The loss is then computed from these logits.
+        """
+        expected_keys = {'input_ids', 'attention_mask', 'pixel_values'}
+        filtered_inputs = {k: v.to(model.device) for k, v in inputs.items() if k in expected_keys}
+        
+        outputs = model(**filtered_inputs, return_loss=True)
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
+
+    def evaluation_loop(
+        self,
+        dataloader: torch.utils.data.DataLoader,
+        description: str,
+        prediction_loss_only: bool = None,
+        ignore_keys: list[str] = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict:
+        """
+        Custom evaluation loop for recall@k metrics.
+        This evaluation loop is NOT used during `trainer.train()` if `eval_strategy="no"`.
+        It would be called manually via `trainer.evaluate()` for post-training analysis.
+        """
+        model = self._wrap_model(self.model, training=False)
+        model.eval()
+
+        all_image_embeds = []
+        all_text_embeds = []
+        total_loss = 0.0
+        num_batches = 0
+        
+        for step, inputs in enumerate(dataloader):
+            expected_keys = {'input_ids', 'attention_mask', 'pixel_values'}
+            inputs = {k: v.to(model.device) for k, v in inputs.items() if k in expected_keys}
+            # forward pass for each input batch of the validation set, to compute loss and embeddings similarity.
+            with torch.no_grad():
+                outputs = model(**inputs, return_loss=True)
+                loss = outputs.loss.item()
+                total_loss += loss
+                num_batches += 1
+
+                image_embeds = outputs.image_embeds
+                text_embeds = outputs.text_embeds
+
+                image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+
+                all_image_embeds.append(image_embeds.cpu().numpy())
+                all_text_embeds.append(text_embeds.cpu().numpy())
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        
+        if len(all_image_embeds) == 0:
+            logging.warning("No image embeddings collected during evaluation. Returning only loss.")
+            return {f"{metric_key_prefix}_loss": avg_loss}
+
+        all_image_embeds = np.concatenate(all_image_embeds)
+        all_text_embeds = np.concatenate(all_text_embeds)
+
+        # Calculate cosine similarity matrix
+        # (N_images, D) @ (D, N_texts) -> (N_images, N_texts)
+        # remember, CLIP's loss isn't just cosine similarity, but it's an elaboration of that concept that introduces other params (temp)
+        similarity_scores = all_image_embeds @ all_text_embeds.T
+
+        num_samples = similarity_scores.shape[0]
+        k_values = [1, 5, 10]
+        recall_at_k = {f"recall@{k}": 0 for k in k_values}
+
+        for i in range(num_samples):
+            top_k_indices = np.argsort(similarity_scores[i, :])[::-1] # Descending order of similarity
+            
+            for k_val in k_values:
+                if i in top_k_indices[:k_val]:
+                    recall_at_k[f"recall@{k_val}"] += 1
+
+        for k_val in k_values:
+            recall_at_k[f"recall@{k_val}"] /= num_samples
+
+        metrics = {f"{metric_key_prefix}_loss": avg_loss}
+        metrics.update({f"{metric_key_prefix}_{k}": v for k, v in recall_at_k.items()})
+
+        logging.info(f"Evaluation metrics: {metrics}")
+        return metrics
+
+
+# --- Main Execution Block ---
 if __name__ == '__main__':
     logging.info("Starting CLIP fine-tuning script.")
-    ### -- Data Loading and Preprocessing -- ###
 
     logging.info("Processing JSON attributes from metadata files...")
-    all_files = glob.glob(os.path.join(METADATA_DIR, '*.json.gz'))
-    if not all_files:
+    all_json_files = glob.glob(os.path.join(METADATA_DIR, '*.json.gz'))
+    if not all_json_files:
         logging.warning(f"No .json.gz files found in {METADATA_DIR}. Exiting.")
         exit()
 
     dfs = []
-    for path in all_files:
+    for path in all_json_files:
         df = process_json_attributes(path)
         if not df.empty:
             text_attr = concatenate_text_attributes(df)
@@ -283,75 +255,71 @@ if __name__ == '__main__':
     text_df = pd.concat(dfs, ignore_index=True)
     logging.info(f"Total processed text attributes rows: {len(text_df)}")
 
-    logging.info("Loading image metadata...")
+    logging.info(f"Loading image metadata CSV..")
     img_df = pd.read_csv(IMAGE_CSV_PATH)
-    img_df = img_df[['image_id', 'path']]
-    img_df = img_df.rename(columns={'image_id': 'main_image_id'})
+    img_df = img_df[['image_id', 'path']].rename(columns={'image_id': 'main_image_id'})
     logging.info(f"Total image metadata rows: {len(img_df)}")
 
     logging.info("Merging text attributes and image metadata...")
     merged_df = pd.merge(text_df, img_df, on='main_image_id', how='inner')
     
-    # --- PATH CONSTRUCTION FOR S3 ---
+    # Construct full S3 image URIs
     merged_df['image_path'] = merged_df['path'].apply(lambda x: f"{BASE_IMAGE_DIR}{x}")
 
-    ### -- Hugging Face Dataset Creation and Preprocessing -- ###
+    ### -- Hugging Face Dataset Creation and Preprocessing --
     logging.info("Creating Hugging Face Dataset...")
-    # datasets.Image() feature can handle S3 URIs if s3fs is installed and configured.
     dataset = Dataset.from_pandas(merged_df).cast_column("image_path", Image())
 
-    dataset = dataset.rename_column("attributes_nl", "text")
-    dataset = dataset.rename_column("image_path", "image")
+    dataset = dataset.rename_columns({"attributes_nl": "text", 
+                                      "image_path": "image"})
     dataset = dataset.remove_columns(['item_id', 'main_image_id', 'path'])
     logging.info(f"Dataset created with {len(dataset)} examples.")
+    
     logging.info("Applying preprocessing transformation...")
-    # Pass processor to preprocess_data via lambda
     dataset.set_transform(lambda examples: preprocess_data(examples, processor)) 
 
-    # Split dataset for training and validation
-    train_test_split = dataset.train_test_split(test_size=0.1, seed=42)
+    train_test_split = dataset.train_test_split(test_size=TEST_SPLIT_RATIO, seed=RANDOM_SEED)
     train_dataset = train_test_split['train']
-    eval_dataset = train_test_split['test']
+    eval_dataset = train_test_split['test'] # Keep eval_dataset for potential manual evaluation later
     logging.info(f"Dataset split: Train {len(train_dataset)} examples, Eval {len(eval_dataset)} examples.")
 
-    ### -- LoRA Configuration -- ###
-    logging.info("Configuring LoRA...")
-    lora_config = LoraConfig(
-        r=8, # Rank of the update matrices. Common values: 8, 16, 32, 64. Higher rank means more parameters, potentially better performance but less efficiency.
-        lora_alpha=16, # LoRA scaling factor. Often set to 2 * r or r. Controls the scaling of the LoRA weights.
-        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
-        lora_dropout=0.1, # Dropout applied to the LoRA layers. Helps prevent overfitting.
-        bias="none", # "none", "all", or "lora_only". "none" is usually fine.
-        # task_type=TaskType.FEATURE_EXTRACTION, # Causing issues later
-    )
+    # --- Save eval_dataset to Google Drive ---
+    os.makedirs(SAVED_EVAL_DATASET_DIR, exist_ok=True)
+    eval_dataset.save_to_disk(SAVED_EVAL_DATASET_DIR)
+    logging.info(f"Evaluation dataset saved to: {SAVED_EVAL_DATASET_DIR}")
 
-    # Apply LoRA to the model
-    model = get_peft_model(model, lora_config)
-    logging.info("LoRA applied to the model.")
+
+    # 3. LoRA Configuration & Application
+    logging.info("Applying LoRA configuration to the model...")
+    model = get_peft_model(model, LORA_CONFIG)
+    logging.info("LoRA applied to the model successfully.")
     model.print_trainable_parameters()
 
-    ### -- Training Setup -- ###
-    data_collator = CLIPDataCollator(processor) # Use the custom collator
+    # 4. Training Setup (Trainer and Arguments)
+    data_collator = CLIPDataCollator() # Corrected: No processor needed here
 
     logging.info("Setting up TrainingArguments...")
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=128,
+        per_device_train_batch_size=TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=EVAL_BATCH_SIZE, # Still provided, but not used during training due to eval_strategy="no"
         gradient_accumulation_steps=1,
-        learning_rate=2e-5,
-        num_train_epochs=3,
+        learning_rate=LEARNING_RATE,
+        num_train_epochs=NUM_TRAIN_EPOCHS,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
-        logging_steps=100,
+        logging_steps=LOGGING_STEPS,
         save_strategy="steps",
-        save_steps=100,
+        save_steps=100, # Saves a checkpoint every 100 steps
         report_to="wandb",
         remove_unused_columns=False,
         fp16=True,
-        dataloader_num_workers=4,
-        eval_strategy="no",
-        load_best_model_at_end=False,
+        dataloader_num_workers=DATALOADER_NUM_WORKERS,
+        
+        # --- Critical Changes for Frequent Saving without Frequent Evaluation ---
+        eval_strategy="no", # Explicitly disables evaluation during trainer.train()
+        load_best_model_at_end=False, # Must be False if eval_strategy is "no"
+        # metric_for_best_model and greater_is_better are ignored when load_best_model_at_end=False
     )
 
     logging.info("Initializing Trainer...")
@@ -359,27 +327,33 @@ if __name__ == '__main__':
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        # eval_dataset=eval_dataset, # Removed: Not needed for eval_strategy="no" during train()
         data_collator=data_collator,
     )
 
-    ### -- Start Training -- ###
-    logging.info("Starting training...")
+    # 5. Start Training
+    logging.info("Starting training process...")
     trainer.train()
+
+    # Optional: Logic to resume from the latest checkpoint if it exists
+    # This assumes OUTPUT_DIR is a persistent location (e.g., Google Drive)
+    # last_checkpoint = None
+    # if os.path.exists(OUTPUT_DIR):
+    #     checkpoints = [d for d in os.listdir(OUTPUT_DIR) if d.startswith('checkpoint-')]
+    #     if checkpoints:
+    #         latest_checkpoint_dir = sorted(checkpoints, key=lambda x: int(x.split('-')[1]))[-1]
+    #         last_checkpoint = os.path.join(OUTPUT_DIR, latest_checkpoint_dir)
+    #         logging.info(f"Found existing checkpoint: {last_checkpoint}. Resuming training.")
+    #     else:
+    #         logging.info("No checkpoints found in output directory. Starting training from scratch.")
+    # else:
+    #     logging.info("Output directory does not exist. Starting training from scratch.")
+    #     os.makedirs(OUTPUT_DIR, exist_ok=True) # Ensure output directory exists if starting fresh
+
+    # trainer.train(resume_from_checkpoint=last_checkpoint)
     logging.info("Training completed.")
 
-    # Save the final LoRA adapters
+    # 6. Save Final LoRA Adapters
     os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
     model.save_pretrained(FINAL_OUTPUT_DIR)
     logging.info(f"Final LoRA adapters saved to {FINAL_OUTPUT_DIR}")
-
-    # Example of how to load and merge for inference (commented out)
-    # from peft import PeftModel, PeftConfig
-    # # Load the base model
-    # base_model = AutoModel.from_pretrained(MODEL_CHECKPOINT).to(device)
-    # # Load the PEFT model
-    # peft_model = PeftModel.from_pretrained(base_model, final_output_dir)
-    # # Merge LoRA weights into the base model (optional, for easier deployment)
-    # merged_model = peft_model.merge_and_unload()
-    # logging.info("LoRA adapters merged into the base model for inference.")
-    # # Save the merged model if desired
-    # # merged_model.save_pretrained("./clip_lora_merged_model")
